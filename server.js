@@ -15,12 +15,7 @@ require('dotenv').config();
 
 const app = express();
 app.use(express.json());
-app.use(cors({
-  origin: [
-    'https://pesakrash.infinityfreeapp.com',
-    'http://localhost'   // keep for local testing
-  ]
-}));
+app.use(cors());
 
 // ═══════════════════════════════════════════════════════════
 // MONGODB CONNECTION
@@ -267,7 +262,7 @@ app.post('/mpesa/callback', (req, res) => {
 // ═══════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════
-const API = 'https://pesakrash-backend.onrender.com';
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`\n🚀 PesaKrash server on http://localhost:${PORT}`);
   console.log(`   POST /auth/register  → create account`);
@@ -275,4 +270,15 @@ app.listen(PORT, () => {
   console.log(`   GET  /auth/me        → get current user`);
   console.log(`   POST /auth/balance   → update balance`);
   console.log(`   POST /stk-push       → M-Pesa STK push\n`);
+
+  // ── Self-ping every 10 minutes to prevent Render free tier sleeping ──
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      await axios.get(SELF_URL);
+      console.log(`[KEEP-ALIVE] Pinged ${SELF_URL}`);
+    } catch (e) {
+      console.warn('[KEEP-ALIVE] Ping failed:', e.message);
+    }
+  }, 10 * 60 * 1000); // every 10 minutes
 });
