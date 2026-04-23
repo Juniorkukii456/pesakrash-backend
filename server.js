@@ -15,7 +15,20 @@ require('dotenv').config();
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://pesakrash.site',
+    'https://www.pesakrash.site',
+    'https://pesakrash.netlify.app',
+    'http://localhost',
+    'http://localhost:5678',
+    'null'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
+app.options('*', cors()); // handle preflight requests
 
 // ═══════════════════════════════════════════════════════════
 // MONGODB CONNECTION
