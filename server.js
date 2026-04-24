@@ -392,42 +392,23 @@ const fs     = require('fs');
 const path   = require('path');
 
 function getSecurityCredential() {
+  // Use pre-computed security credential from environment variable
+  // Generate it at: https://developer.safaricom.co.ke/test_credentials
+  // Under "Security Credential Generator" — use testapi / Safaricom999!
+  const envCred = process.env.B2C_SECURITY_CREDENTIAL;
+  if (envCred) return envCred;
+
+  // Fallback: compute dynamically using Safaricom sandbox certificate
   try {
-    // Safaricom sandbox public certificate
-    const cert = `-----BEGIN CERTIFICATE-----
-MIIGKzCCBBOgAwIBAgIQfde5DGRuAkK3GpBVyvhZpDANBgkqhkiG9w0BAQsFADCB
-jzELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0FyaXpvbmExEzARBgNVBAcMClNjb3R0
-c2RhbGUxJTAjBgNVBAoMHFN0YXJmaWVsZCBUZWNobm9sb2dpZXMsIEluYy4xMjAw
-BgNVBAMMKVN0YXJmaWVsZCBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAtIEcy
-MB4XDTE1MDUyNTEyMDAwMFoXDTM3MTIzMTAxMDAwMFowgYYxCzAJBgNVBAYTAlVT
-MRAwDgYDVQQIEwdBcml6b25hMRMwEQYDVQQHEwpTY290dHNkYWxlMSUwIwYDVQQK
-ExxTdGFyZmllbGQgVGVjaG5vbG9naWVzLCBJbmMuMSkwJwYDVQQDEyBTdGFyZmll
-bGQgU2VjdXJlIENlcnRpZmljYXRlIEF1dGhvcml0eTAeFw0xNTEwMTUwNzAwMDBa
-Fw0yMDEwMTUwNzAwMDBaMFoxCzAJBgNVBAYTAktFMRAwDgYDVQQIEwdOYWlyb2Jp
-MQ8wDQYDVQQHEwZOYWlyb2IxGDAWBgNVBAoTD1NhZmFyaWNvbSBQTEMwggEiMA0G
-CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC4dBIKk24sqJlmEBpfHdCWuYrTQhCz
-LD6hWjIx3feMW6YBtpBMirFMDiPD5tGf5D5/4FTDPHs2j7b5jwDfU3VCVAM4Lk6
-8l06LFMRTbhwP2q4VtL0L0QEyImLLBzJVBX7uBAlRRN2sQOJNT5OEiFJbQME3lp
-P4j4Cc2xHkHm0TJBknTVRPjJOCwJApBl1Wph0yXLpVEimFPXbTiRxN3LuA32mBn
-HWvSdAGJNjT0Ll5P5s06lfCa7M3bC/H5Z5M/WZmVuivW/lRCiEKNMhUOlkiuBNj
-cxM2bBKwAGJzgXbWFfF7jTEGbGqbLd4rNcGaGBMJr1Wue+ZGK+h+5rBPAgMBAAGj
-ggEdMIIBGTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4E
-FgQUPwEspjJgMBEp+AK40gSd+bR6h3AwHwYDVR0jBBgwFoAUfALYocAt5DXQM5y
-M5hU7rUbDX4wgYwGA1UdHwSBhDCBgTA/oD2gO4Y5aHR0cDovL2NybC5zdGFyZmll
-bGR0ZWNoLmNvbS9yZXBvc2l0b3J5L3Nmcm9vdGcyLmNybDBEoEKgQIY+aHR0cDov
-L2NybC5zdGFyZmllbGR0ZWNoLmNvbS9yZXBvc2l0b3J5L3Ngcm9vdGcycmVhc29u
-cy5jcmwwCgYIKoZIzj0EAwIDSAAwRQIhALMDZpqI7q3VL14L6m7Vm6+pcBfYMcyD
-JFnLdHCgIBSCAiB9/D56/bpIFYeS+PnLsJ5Y1Wgpjv1PxFiKn0kFGUqCZQ==
------END CERTIFICATE-----`;
+    const cert = fs.readFileSync(path.join(__dirname, 'sandbox.cer'));
     const buffer = Buffer.from(B2C_INITIATOR_PASS, 'utf8');
-    return crypto.publicEncrypt({
-      key: cert,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING
-    }, buffer).toString('base64');
+    return crypto.publicEncrypt(
+      { key: cert, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
+      buffer
+    ).toString('base64');
   } catch (e) {
-    console.error('[B2C] Security credential error:', e.message);
-    // Fallback for sandbox — pre-computed
-    return 'SandboxSecurityCredentialFallback';
+    console.error('[B2C] Security credential error — set B2C_SECURITY_CREDENTIAL env var:', e.message);
+    return '';
   }
 }
 
