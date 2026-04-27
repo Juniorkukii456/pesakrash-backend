@@ -381,7 +381,7 @@ const DARAJA_BASE     = 'https://sandbox.safaricom.co.ke';
 // ── B2C CREDENTIALS — Sandbox ───────────────────────────────
 const B2C_CONSUMER_KEY    = process.env.B2C_CONSUMER_KEY    || 'gGqhgrm2UT3BSyeeiUz9ZUhtVMnQX5FP3cjhmZEloQ8Apl8I';
 const B2C_CONSUMER_SECRET = process.env.B2C_CONSUMER_SECRET || 'CB5ZnmtfH398fkNDa08TPKkg5rgALAPLQG7IPQt6rEpdXgIr13FpX2b7R3VdJ6BC';
-const B2C_SHORTCODE       = process.env.B2C_SHORTCODE       || '600984';
+const B2C_SHORTCODE       = process.env.B2C_SHORTCODE       || '600986';
 const B2C_INITIATOR_NAME  = process.env.B2C_INITIATOR_NAME  || 'testapi';
 const B2C_INITIATOR_PASS  = process.env.B2C_INITIATOR_PASS  || 'Safaricom999!';
 const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || 'https://pesakrash-backend.onrender.com';
