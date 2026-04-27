@@ -594,17 +594,21 @@ app.post('/b2c/withdraw', authMiddleware, async (req, res) => {
     const token = await getB2CToken();
     const secCred = getSecurityCredential();
 
+    // Generate unique OriginatorConversationID
+    const originatorConvID = 'PKR-' + Date.now() + '-' + Math.random().toString(36).slice(2,8).toUpperCase();
+
     const payload = {
-      InitiatorName      : B2C_INITIATOR_NAME,
-      SecurityCredential : secCred,
-      CommandID          : 'BusinessPayment',
-      Amount             : amountInt,
-      PartyA             : B2C_SHORTCODE,
-      PartyB             : msisdn,
-      Remarks            : 'PesaKrash Withdrawal',
-      QueueTimeOutURL    : `${RENDER_URL}/b2c/timeout`,
-      ResultURL          : `${RENDER_URL}/b2c/result`,
-      Occasion           : 'PesaKrash Withdraw'
+      OriginatorConversationID : originatorConvID,
+      InitiatorName            : B2C_INITIATOR_NAME,
+      SecurityCredential       : secCred,
+      CommandID                : 'BusinessPayment',
+      Amount                   : amountInt,
+      PartyA                   : B2C_SHORTCODE,
+      PartyB                   : msisdn,
+      Remarks                  : 'PesaKrash Withdrawal',
+      QueueTimeOutURL          : `${RENDER_URL}/b2c/timeout`,
+      ResultURL                : `${RENDER_URL}/b2c/result`,
+      Occasion                 : 'PesaKrash Withdraw'
     };
 
     const b2cRes = await axios.post(
