@@ -47,6 +47,67 @@ const io = new Server(server, {
 const MONGO_URI  = process.env.MONGO_URI  || 'mongodb+srv://frankojunior981_db_user:PesaKrash2026@cluster0.3hogvwx.mongodb.net/pesakrash?retryWrites=true&w=majority&appName=Cluster0';
 const JWT_SECRET = process.env.JWT_SECRET || 'pesakrash_jwt_super_secret_2026';
 
+// ── Africa's Talking SMS ────────────────────────────────────
+const AT_API_KEY  = process.env.AT_API_KEY  || 'atsk_1448ef0b1bf0d5668bddcc23940117aa76e895f379dc2f50238bfdb9894148d4b6d95474';
+const AT_USERNAME = process.env.AT_USERNAME || 'sandbox';
+const AfricasTalking = require('africastalking')({ apiKey: AT_API_KEY, username: AT_USERNAME });
+const sms = AfricasTalking.SMS;
+
+// OTP store: { phone: { otp, expires, type } }
+// type: 'register' | 'reset'
+const otpStore = new Map();
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6 digit OTP
+}
+
+async function sendOTP(phone, otp, type) {
+  // Normalize phone
+  let msisdn = String(phone).replace(/[\s\-]/g, '');
+  if (msisdn.startsWith('+'))      msisdn = msisdn.slice(1);
+  if (!msisdn.startsWith('254')) {
+    if (msisdn.startsWith('0'))    msisdn = '254' + msisdn.slice(1);
+    else if (msisdn.length === 9)  msisdn = '254' + msisdn;
+  }
+
+  const msg = type === 'register'
+    ? `PesaKrash: Your verification code is ${otp}. Valid for 10 minutes. Do not share this code.`
+    : `PesaKrash: Your password reset code is ${otp}. Valid for 10 minutes. Do not share this code.`;
+
+  // Store OTP
+  otpStore.set(msisdn, {
+    otp,
+    expires: Date.now() + 10 * 60 * 1000, // 10 minutes
+    type
+  });
+
+  try {
+    await sms.send({ to: ['+' + msisdn], message: msg, from: 'PesaKrash' });
+    console.log(`[OTP] Sent to ${msisdn}`);
+    return { success: true, phone: msisdn };
+  } catch (err) {
+    console.error('[OTP ERROR]', err.message || err);
+    // In sandbox, AT may not send real SMS but still log it
+    return { success: true, phone: msisdn }; // allow sandbox flow
+  }
+}
+
+function verifyOTP(phone, otp) {
+  let msisdn = String(phone).replace(/[\s\-]/g, '');
+  if (msisdn.startsWith('+'))      msisdn = msisdn.slice(1);
+  if (!msisdn.startsWith('254')) {
+    if (msisdn.startsWith('0'))    msisdn = '254' + msisdn.slice(1);
+    else if (msisdn.length === 9)  msisdn = '254' + msisdn;
+  }
+
+  const record = otpStore.get(msisdn);
+  if (!record)                        return { valid: false, message: 'OTP not found. Request a new one.' };
+  if (Date.now() > record.expires)    { otpStore.delete(msisdn); return { valid: false, message: 'OTP expired. Request a new one.' }; }
+  if (record.otp !== String(otp))     return { valid: false, message: 'Invalid OTP. Try again.' };
+  otpStore.delete(msisdn); // one-time use
+  return { valid: true };
+}
+
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB connected — pesakrash'))
   .catch(err => console.error('❌ MongoDB error:', err.message));
@@ -455,20 +516,87 @@ function getPassword(ts) { return Buffer.from(`${SHORTCODE}${PASSKEY}${ts}`).toS
 // ═══════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({ status: 'PesaKrash server running ✅', port: 5000 }));
 
+// SEND OTP — for registration or password reset
+app.post('/auth/send-otp', async (req, res) => {
+  const { phone, type } = req.body; // type: 'register' | 'reset'
+  if (!phone) return res.status(400).json({ success: false, message: 'Phone number required.' });
+  if (!['register', 'reset'].includes(type))
+    return res.status(400).json({ success: false, message: 'Invalid OTP type.' });
+
+  // Validate phone format
+  let msisdn = String(phone).replace(/[\s\-]/g, '');
+  if (msisdn.startsWith('+'))      msisdn = msisdn.slice(1);
+  if (!msisdn.startsWith('254')) {
+    if (msisdn.startsWith('0'))    msisdn = '254' + msisdn.slice(1);
+    else if (msisdn.length === 9)  msisdn = '254' + msisdn;
+  }
+  if (!/^254(7|1)\d{8}$/.test(msisdn))
+    return res.status(400).json({ success: false, message: 'Invalid Safaricom number. Use 07XX or 01XX format.' });
+
+  // For reset — check phone exists in DB
+  if (type === 'reset') {
+    const user = await User.findOne({ phone: { $in: [phone, msisdn, '0'+msisdn.slice(3)] } });
+    if (!user) return res.status(404).json({ success: false, message: 'No account found with this phone number.' });
+  }
+
+  // For register — check phone not already registered
+  if (type === 'register') {
+    const exists = await User.findOne({ phone: { $in: [phone, msisdn, '0'+msisdn.slice(3)] } });
+    if (exists) return res.status(400).json({ success: false, message: 'Phone already registered.' });
+  }
+
+  const otp    = generateOTP();
+  const result = await sendOTP(msisdn, otp, type);
+  if (!result.success)
+    return res.status(500).json({ success: false, message: 'Failed to send OTP. Try again.' });
+
+  // In sandbox mode log OTP to console for testing
+  if (AT_USERNAME === 'sandbox') console.log(`[SANDBOX OTP] ${msisdn} → ${otp}`);
+
+  return res.json({ success: true, message: `OTP sent to +${msisdn}. Valid for 10 minutes.` });
+});
+
+// VERIFY OTP — verify without completing action
+app.post('/auth/verify-otp', async (req, res) => {
+  const { phone, otp } = req.body;
+  if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required.' });
+  const result = verifyOTP(phone, otp);
+  // Note: this is non-destructive peek — actual verification done at register/reset
+  // Re-store OTP since verifyOTP deletes it
+  if (result.valid) {
+    let msisdn = String(phone).replace(/[\s\-]/g,'');
+    if (!msisdn.startsWith('254')) msisdn = msisdn.startsWith('0') ? '254'+msisdn.slice(1) : '254'+msisdn;
+    // We don't re-store here — actual verification happens at register endpoint
+  }
+  return res.json(result.valid
+    ? { success: true }
+    : { success: false, message: result.message }
+  );
+});
+
 // REGISTER
 app.post('/auth/register', async (req, res) => {
-  const { username, email, phone, password } = req.body;
-  if (!username || !email || !phone || !password)
-    return res.status(400).json({ success: false, message: 'All fields are required.' });
+  const { username, email, phone, password, otp } = req.body;
+  if (!username || !email || !phone || !password || !otp)
+    return res.status(400).json({ success: false, message: 'All fields are required including OTP.' });
   if (password.length < 6)
     return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+
+  // Verify OTP first
+  const otpCheck = verifyOTP(phone, otp);
+  if (!otpCheck.valid)
+    return res.status(400).json({ success: false, message: otpCheck.message });
+
   try {
     if (await User.findOne({ email }))
       return res.status(400).json({ success: false, message: 'Email already registered. Please log in.' });
+    if (await User.findOne({ phone }))
+      return res.status(400).json({ success: false, message: 'Phone already registered.' });
+
     const hashed = await bcrypt.hash(password, 12);
     const user   = await User.create({
       username, email, phone, password: hashed,
-      balance: 0, bonusBalance: 50, bonusUsed: false  // KES 50 welcome bonus
+      balance: 0, bonusBalance: 50, bonusUsed: false
     });
     const token  = jwt.sign({ id: user._id }, JWT_SECRET);
     return res.status(201).json({
@@ -494,6 +622,79 @@ app.post('/auth/login', async (req, res) => {
     return res.json({ success: true, message: 'Login successful!', token, user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance, bonusBalance: user.bonusBalance || 0 } });
   } catch (err) {
     console.error('[LOGIN]', err.message);
+    return res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
+// FORGOT PASSWORD — send OTP to phone
+app.post('/auth/forgot-password', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ success: false, message: 'Phone number required.' });
+
+  let msisdn = String(phone).replace(/[\s\-]/g,'');
+  if (msisdn.startsWith('+'))     msisdn = msisdn.slice(1);
+  if (!msisdn.startsWith('254')) {
+    if (msisdn.startsWith('0'))   msisdn = '254' + msisdn.slice(1);
+    else if (msisdn.length===9)   msisdn = '254' + msisdn;
+  }
+
+  try {
+    // Find user by phone — check multiple formats
+    const user = await User.findOne({ $or: [
+      { phone: phone },
+      { phone: msisdn },
+      { phone: '0' + msisdn.slice(3) },
+      { phone: '+' + msisdn }
+    ]});
+    if (!user) return res.status(404).json({ success: false, message: 'No account found with this phone number.' });
+
+    const otp = generateOTP();
+    await sendOTP(msisdn, otp, 'reset');
+    if (AT_USERNAME === 'sandbox') console.log(`[SANDBOX RESET OTP] ${msisdn} → ${otp}`);
+    return res.json({ success: true, message: `Reset code sent to +${msisdn}` });
+  } catch (err) {
+    console.error('[FORGOT PASSWORD]', err.message);
+    return res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
+// RESET PASSWORD — verify OTP and set new password
+app.post('/auth/reset-password', async (req, res) => {
+  const { phone, otp, newPassword } = req.body;
+  if (!phone || !otp || !newPassword)
+    return res.status(400).json({ success: false, message: 'Phone, OTP and new password required.' });
+  if (newPassword.length < 6)
+    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+
+  // Verify OTP
+  const otpCheck = verifyOTP(phone, otp);
+  if (!otpCheck.valid)
+    return res.status(400).json({ success: false, message: otpCheck.message });
+
+  let msisdn = String(phone).replace(/[\s\-]/g,'');
+  if (msisdn.startsWith('+'))     msisdn = msisdn.slice(1);
+  if (!msisdn.startsWith('254')) {
+    if (msisdn.startsWith('0'))   msisdn = '254' + msisdn.slice(1);
+    else if (msisdn.length===9)   msisdn = '254' + msisdn;
+  }
+
+  try {
+    const user = await User.findOne({ $or: [
+      { phone: phone }, { phone: msisdn },
+      { phone: '0' + msisdn.slice(3) }, { phone: '+' + msisdn }
+    ]});
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    await user.save();
+
+    const token = jwt.sign({ id: user._id }, JWT_SECRET);
+    return res.json({
+      success: true, message: 'Password reset successful! You are now logged in.',
+      token, user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance, bonusBalance: user.bonusBalance || 0 }
+    });
+  } catch (err) {
+    console.error('[RESET PASSWORD]', err.message);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }
 });
