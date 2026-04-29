@@ -55,12 +55,14 @@ mongoose.connect(MONGO_URI)
 // USER MODEL
 // ═══════════════════════════════════════════════════════════
 const userSchema = new mongoose.Schema({
-  username  : { type: String, required: true, trim: true },
-  email     : { type: String, required: true, unique: true, lowercase: true, trim: true },
-  phone     : { type: String, required: true, trim: true },
-  password  : { type: String, required: true },
-  balance   : { type: Number, default: 0 },
-  createdAt : { type: Date, default: Date.now }
+  username      : { type: String, required: true, trim: true },
+  email         : { type: String, required: true, unique: true, lowercase: true, trim: true },
+  phone         : { type: String, required: true, trim: true },
+  password      : { type: String, required: true },
+  balance       : { type: Number, default: 0 },
+  bonusBalance  : { type: Number, default: 0 },  // welcome bonus — not withdrawable
+  bonusUsed     : { type: Boolean, default: false }, // track if bonus was already given
+  createdAt     : { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
@@ -157,10 +159,8 @@ async function startCrashed() {
       p.settled = true;
       house.profit += p.bet;
       house.totalBets++;
-      lossPromises.push(
-        User.findByIdAndUpdate(p.userId, { $inc: { balance: -p.bet } }).catch(() => {})
-      );
-      // Notify the specific player
+      // Balance already deducted on bet placement — no further deduction needed
+      // Just notify the player
       io.to(sid).emit('round_result', { won: false, amount: p.bet, multiplier: crashPt });
     }
   });
@@ -286,19 +286,36 @@ io.on('connection', (socket) => {
 
       const user = await User.findById(decoded.id);
       if (!user) return socket.emit('bet_result', { success: false, message: 'User not found.' });
-      if (user.balance < amount) return socket.emit('bet_result', { success: false, message: 'Insufficient balance.' });
 
-      // Deduct bet from balance
-      user.balance = Math.round((user.balance - amount) * 100) / 100;
+      const realBal  = user.balance || 0;
+      const bonusBal = user.bonusBalance || 0;
+      const totalAvail = Math.round((realBal + bonusBal) * 100) / 100;
+
+      if (totalAvail < amount) return socket.emit('bet_result', { success: false, message: 'Insufficient balance.' });
+
+      // Use bonus first, then real balance
+      let bonusUsed = 0, realUsed = 0;
+      if (bonusBal >= amount) {
+        bonusUsed = amount;
+      } else {
+        bonusUsed = bonusBal;
+        realUsed  = Math.round((amount - bonusBal) * 100) / 100;
+      }
+      user.bonusBalance = Math.round((bonusBal - bonusUsed) * 100) / 100;
+      user.balance      = Math.round((realBal  - realUsed)  * 100) / 100;
       await user.save();
 
       roundBets[socket.id] = {
         userId: decoded.id, username: user.username,
-        bet: amount, settled: false, cashedOut: false, cashOutAt: null
+        bet: amount, bonusUsed, realUsed,
+        settled: false, cashedOut: false, cashOutAt: null
       };
       house.totalBets++;
 
-      socket.emit('bet_result', { success: true, balance: user.balance, amount });
+      socket.emit('bet_result', {
+        success: true, balance: user.balance,
+        bonusBalance: user.bonusBalance, amount
+      });
       broadcastAdmin();
     } catch (err) {
       socket.emit('bet_result', { success: false, message: 'Server error.' });
@@ -323,9 +340,13 @@ io.on('connection', (socket) => {
 
       const user = await User.findById(decoded.id);
       if (user) {
+        // Winnings always go to real balance regardless of bonus used
         user.balance = Math.round((user.balance + winAmt) * 100) / 100;
         await user.save();
-        socket.emit('cashout_result', { success: true, multiplier: m, winAmount: winAmt, balance: user.balance });
+        socket.emit('cashout_result', {
+          success: true, multiplier: m, winAmount: winAmt,
+          balance: user.balance, bonusBalance: user.bonusBalance || 0
+        });
       }
       socket.emit('round_result', { won: true, amount: winAmt, multiplier: m });
       broadcastAdmin();
@@ -445,9 +466,15 @@ app.post('/auth/register', async (req, res) => {
     if (await User.findOne({ email }))
       return res.status(400).json({ success: false, message: 'Email already registered. Please log in.' });
     const hashed = await bcrypt.hash(password, 12);
-    const user   = await User.create({ username, email, phone, password: hashed, balance: 0 });
+    const user   = await User.create({
+      username, email, phone, password: hashed,
+      balance: 0, bonusBalance: 50, bonusUsed: false  // KES 50 welcome bonus
+    });
     const token  = jwt.sign({ id: user._id }, JWT_SECRET);
-    return res.status(201).json({ success: true, message: 'Account created!', token, user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance } });
+    return res.status(201).json({
+      success: true, message: 'Account created! You received a KES 50 welcome bonus!', token,
+      user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance, bonusBalance: user.bonusBalance }
+    });
   } catch (err) {
     console.error('[REGISTER]', err.message);
     return res.status(500).json({ success: false, message: 'Server error.' });
@@ -464,7 +491,7 @@ app.post('/auth/login', async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     const token = jwt.sign({ id: user._id }, JWT_SECRET);
-    return res.json({ success: true, message: 'Login successful!', token, user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance } });
+    return res.json({ success: true, message: 'Login successful!', token, user: { id: user._id, username: user.username, email: user.email, phone: user.phone, balance: user.balance, bonusBalance: user.bonusBalance || 0 } });
   } catch (err) {
     console.error('[LOGIN]', err.message);
     return res.status(500).json({ success: false, message: 'Server error.' });
@@ -476,7 +503,10 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('-password');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    return res.json({ success: true, user });
+    return res.json({ success: true, user: {
+      id: user._id, username: user.username, email: user.email,
+      phone: user.phone, balance: user.balance, bonusBalance: user.bonusBalance || 0
+    }});
   } catch { return res.status(500).json({ success: false, message: 'Server error.' }); }
 });
 
@@ -588,7 +618,7 @@ app.post('/b2c/withdraw', authMiddleware, async (req, res) => {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     if (user.balance < amountInt)
-      return res.status(400).json({ success: false, message: 'Insufficient balance.' });
+      return res.status(400).json({ success: false, message: 'Insufficient real balance. Bonus funds cannot be withdrawn.' });
 
     // Get B2C token
     const token = await getB2CToken();
