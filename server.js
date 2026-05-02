@@ -166,8 +166,8 @@ let customNext = null;
 let forceFlag  = false;
 let skipFlag   = false;
 
-// House stats
-const house = { profit: 0, totalBets: 0, rounds: 0, crashSum: 0, instantCrashes: 0, houseEdge: HOUSE_EDGE };
+// House stats — houseEdge set after HOUSE_EDGE is declared
+const house = { profit: 0, totalBets: 0, rounds: 0, crashSum: 0, instantCrashes: 0, houseEdge: 0.05 };
 
 // Active bets this round: { socketId: { userId, username, bet, settled, cashedOut, cashOutAt } }
 let roundBets = {};
@@ -183,6 +183,8 @@ let connectedPlayers = {};
 // ═══════════════════════════════════════════════════════════
 const HOUSE_EDGE = parseFloat(process.env.HOUSE_EDGE || '0.05'); // default 5%
 const MAX_CRASH  = parseFloat(process.env.MAX_CRASH  || '200');  // max multiplier cap
+// Update house edge after HOUSE_EDGE is initialized
+setTimeout(() => { house.houseEdge = HOUSE_EDGE; }, 0);
 
 function genCrash() {
   // Admin override — custom crash point for next round
