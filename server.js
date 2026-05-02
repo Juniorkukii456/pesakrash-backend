@@ -82,13 +82,21 @@ async function sendOTP(phone, otp, type) {
   });
 
   try {
-    await sms.send({ to: ['+' + msisdn], message: msg });
-    console.log(`[OTP] Sent to ${msisdn}`);
+    const result = await sms.send({ to: ['+' + msisdn], message: msg });
+    console.log(`[OTP] Sent to ${msisdn} — Response:`, JSON.stringify(result));
+    // Check if AT accepted it
+    const recipient = result?.SMSMessageData?.Recipients?.[0];
+    if (recipient) {
+      console.log(`[OTP] Status: ${recipient.status} | Cost: ${recipient.cost} | Number: ${recipient.number}`);
+      if (recipient.status !== 'Success') {
+        console.error(`[OTP FAILED] Reason: ${recipient.status}`);
+        return { success: false, error: recipient.status };
+      }
+    }
     return { success: true, phone: msisdn };
   } catch (err) {
     console.error('[OTP ERROR]', err.message || err);
-    // In sandbox, AT may not send real SMS but still log it
-    return { success: true, phone: msisdn }; // allow sandbox flow
+    return { success: false, error: err.message };
   }
 }
 
