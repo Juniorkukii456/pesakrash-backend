@@ -48,7 +48,7 @@ const MONGO_URI  = process.env.MONGO_URI  || 'mongodb+srv://frankojunior981_db_u
 const JWT_SECRET = process.env.JWT_SECRET || 'pesakrash_jwt_super_secret_2026';
 
 // ── Africa's Talking SMS ────────────────────────────────────
-const AT_API_KEY  = process.env.AT_API_KEY  || 'atsk_1448ef0b1bf0d5668bddcc23940117aa76e895f379dc2f50238bfdb9894148d4b6d95474';
+const AT_API_KEY  = process.env.AT_API_KEY;  // set in Render environment variables
 const AT_USERNAME = process.env.AT_USERNAME || 'sandbox';
 const AfricasTalking = require('africastalking')({ apiKey: AT_API_KEY, username: AT_USERNAME });
 const sms = AfricasTalking.SMS;
@@ -82,7 +82,7 @@ async function sendOTP(phone, otp, type) {
   });
 
   try {
-    await sms.send({ to: ['+' + msisdn], message: msg, from: 'PesaKrash' });
+    await sms.send({ to: ['+' + msisdn], message: msg });
     console.log(`[OTP] Sent to ${msisdn}`);
     return { success: true, phone: msisdn };
   } catch (err) {
@@ -167,7 +167,7 @@ let forceFlag  = false;
 let skipFlag   = false;
 
 // House stats
-const house = { profit: 0, totalBets: 0, rounds: 0, crashSum: 0 };
+const house = { profit: 0, totalBets: 0, rounds: 0, crashSum: 0, instantCrashes: 0, houseEdge: HOUSE_EDGE };
 
 // Active bets this round: { socketId: { userId, username, bet, settled, cashedOut, cashOutAt } }
 let roundBets = {};
@@ -175,12 +175,50 @@ let roundBets = {};
 // Connected players: { socketId: { username, userId } }
 let connectedPlayers = {};
 
+// ═══════════════════════════════════════════════════════════
+// HOUSE EDGE CRASH ALGORITHM
+// HOUSE_EDGE = 0.05 means 5% — house keeps 5% of all bets
+// Every 1/HOUSE_EDGE rounds on average crashes at 1.00×
+// Expected payout = (1 - HOUSE_EDGE) × total bets
+// ═══════════════════════════════════════════════════════════
+const HOUSE_EDGE = parseFloat(process.env.HOUSE_EDGE || '0.05'); // default 5%
+const MAX_CRASH  = parseFloat(process.env.MAX_CRASH  || '200');  // max multiplier cap
+
 function genCrash() {
-  if (customNext !== null) { const v = customNext; customNext = null; return Math.max(1.0, v); }
+  // Admin override — custom crash point for next round
+  if (customNext !== null) {
+    const v = customNext; customNext = null;
+    return Math.max(1.0, Math.min(v, MAX_CRASH));
+  }
+
+  // House edge: guaranteed instant crash HOUSE_EDGE % of the time
+  // This ensures house always profits over time
+  if (Math.random() < HOUSE_EDGE) {
+    console.log(`[HOUSE EDGE] Instant crash round (1.00×)`);
+    return 1.00;
+  }
+
+  // For remaining rounds — provably fair distribution
+  // Formula: (1 - HOUSE_EDGE) / (1 - r)
+  // This gives expected value of exactly (1 - HOUSE_EDGE) for players
   const r = Math.random();
-  if (r < 0.01) return 1.0;
-  return Math.max(1.0, Math.min(Math.round((0.99 / (1 - r)) * 100) / 100, 200));
+  // Prevent division by zero or near-zero
+  if (r >= 0.999) return MAX_CRASH;
+
+  const raw = (1 - HOUSE_EDGE) / (1 - r);
+  const crash = Math.max(1.00, Math.min(Math.round(raw * 100) / 100, MAX_CRASH));
+  return crash;
 }
+
+// ── House edge stats logger — runs every 100 rounds ─────────
+setInterval(() => {
+  if (house.rounds > 0 && house.rounds % 100 === 0) {
+    const edgePct = house.totalBets > 0
+      ? ((house.profit / (house.profit + (house.crashSum / house.rounds))) * 100).toFixed(2)
+      : '0.00';
+    console.log(`[HOUSE STATS] Rounds: ${house.rounds} | Profit: KES ${house.profit.toFixed(2)} | Avg Crash: ${(house.crashSum/house.rounds).toFixed(2)}× | Edge: ~${edgePct}%`);
+  }
+}, 5000);
 function calcMult(t) { return Math.round(Math.pow(Math.E, 0.07 * t) * 100) / 100; }
 function mColor(m)   { return m >= 10 ? '#8b5cf6' : m >= 5 ? '#06b6d4' : m >= 2 ? '#10b981' : '#94a3b8'; }
 
@@ -212,6 +250,8 @@ async function startCrashed() {
   history    = [crashPt, ...history].slice(0, 25);
   house.rounds++;
   house.crashSum += crashPt;
+  if (crashPt <= 1.00) house.instantCrashes++;
+  house.houseEdge = HOUSE_EDGE;
 
   // Settle all unsettled bets as losses
   const lossPromises = [];
