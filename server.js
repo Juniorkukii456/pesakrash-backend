@@ -135,6 +135,39 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
+// ── Transaction Model ─────────────────────────────────────
+const txSchema = new mongoose.Schema({
+  userId       : { type: mongoose.Schema.Types.ObjectId, ref:'User', required:true },
+  username     : String,
+  type         : { type: String, enum:['deposit','withdrawal','bet','win','loss','bonus'], required:true },
+  amount       : { type: Number, required:true },
+  status       : { type: String, enum:['pending','completed','failed','cancelled'], default:'completed' },
+  mpesaRef     : String,
+  phone        : String,
+  note         : String,
+  roundId      : Number,
+  multiplier   : Number,
+  balanceBefore: Number,
+  balanceAfter : Number,
+  createdAt    : { type: Date, default: Date.now }
+});
+const Transaction = mongoose.model('Transaction', txSchema);
+
+// ── Withdrawal Request Model ──────────────────────────────
+const wdSchema = new mongoose.Schema({
+  userId        : { type: mongoose.Schema.Types.ObjectId, ref:'User', required:true },
+  username      : String,
+  phone         : { type: String, required:true },
+  amount        : { type: Number, required:true },
+  status        : { type: String, enum:['pending','approved','rejected','processing','completed','failed'], default:'pending' },
+  mpesaRef      : String,
+  adminNote     : String,
+  conversationId: String,
+  createdAt     : { type: Date, default: Date.now },
+  processedAt   : Date
+});
+const WithdrawalRequest = mongoose.model('WithdrawalRequest', wdSchema);
+
 // ═══════════════════════════════════════════════════════════
 // AUTH MIDDLEWARE
 // ═══════════════════════════════════════════════════════════
@@ -270,9 +303,20 @@ async function startCrashed() {
       p.settled = true;
       house.profit += p.bet;
       house.totalBets++;
-      // Balance already deducted on bet placement — no further deduction needed
-      // Just notify the player
-      io.to(sid).emit('round_result', { won: false, amount: p.bet, multiplier: crashPt });
+      // Save loss transaction + notify player
+      lossPromises.push(
+        (async () => {
+          try {
+            await Transaction.create({
+              userId: p.userId, username: p.username,
+              type: 'loss', amount: p.bet, status: 'completed',
+              roundId, multiplier: crashPt,
+              note: `Crashed @ ${crashPt.toFixed(2)}× — Round #${roundId}`
+            });
+          } catch(e) { console.error('[LOSS TX]', e.message); }
+          io.to(sid).emit('round_result', { won: false, amount: p.bet, multiplier: crashPt });
+        })()
+      );
     }
   });
   await Promise.all(lossPromises);
@@ -423,6 +467,15 @@ io.on('connection', (socket) => {
       };
       house.totalBets++;
 
+      // Save bet transaction
+      await Transaction.create({
+        userId: user._id, username: user.username,
+        type: 'bet', amount, status: 'completed',
+        roundId, note: `Bet placed — Round #${roundId}`,
+        balanceBefore: user.balance + amount,
+        balanceAfter: user.balance
+      }).catch(e => console.error('[BET TX]', e.message));
+
       socket.emit('bet_result', {
         success: true, balance: user.balance,
         bonusBalance: user.bonusBalance, amount
@@ -451,9 +504,19 @@ io.on('connection', (socket) => {
 
       const user = await User.findById(decoded.id);
       if (user) {
-        // Winnings always go to real balance regardless of bonus used
         user.balance = Math.round((user.balance + winAmt) * 100) / 100;
         await user.save();
+
+        // Save win transaction
+        await Transaction.create({
+          userId: user._id, username: user.username,
+          type: 'win', amount: winAmt, status: 'completed',
+          roundId, multiplier: m,
+          note: `Cashed out @ ${m.toFixed(2)}× — Round #${roundId}`,
+          balanceBefore: user.balance - winAmt,
+          balanceAfter: user.balance
+        }).catch(e => console.error('[WIN TX]', e.message));
+
         socket.emit('cashout_result', {
           success: true, multiplier: m, winAmount: winAmt,
           balance: user.balance, bonusBalance: user.bonusBalance || 0
@@ -826,6 +889,294 @@ app.post('/stk-push', authMiddleware, async (req, res) => {
     console.error('[STK ERROR]', err.response?.data || err.message);
     return res.status(500).json({ success: false, message: err.response?.data?.errorMessage || err.message });
   }
+});
+
+// ═══════════════════════════════════════════════════════════
+// C2B — Register URLs (run once after going live)
+// ═══════════════════════════════════════════════════════════
+app.post('/c2b/register', authMiddleware, async (req, res) => {
+  try {
+    const token = await getDarajaToken();
+    const r = await axios.post(`${DARAJA_BASE}/mpesa/c2b/v1/registerurl`,
+      { ShortCode: SHORTCODE, ResponseType:'Completed',
+        ConfirmationURL:`${RENDER_URL}/c2b/confirmation`,
+        ValidationURL:`${RENDER_URL}/c2b/validation` },
+      { headers:{ Authorization:`Bearer ${token}` } }
+    );
+    console.log('[C2B REGISTER]', r.data);
+    return res.json({ success:true, data:r.data });
+  } catch(err) {
+    console.error('[C2B REGISTER]', err.response?.data||err.message);
+    return res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// C2B Validation — Safaricom asks: accept this payment?
+// ═══════════════════════════════════════════════════════════
+app.post('/c2b/validation', (req, res) => {
+  console.log('[C2B VALIDATION]', JSON.stringify(req.body, null, 2));
+  return res.json({ ResultCode:0, ResultDesc:'Accepted', ThirdPartyTransID: req.body.TransID||'' });
+});
+
+// ═══════════════════════════════════════════════════════════
+// C2B Confirmation — payment confirmed, credit player
+// ═══════════════════════════════════════════════════════════
+app.post('/c2b/confirmation', async (req, res) => {
+  const data = req.body;
+  console.log('[C2B CONFIRMATION]', JSON.stringify(data, null, 2));
+  try {
+    const { TransID, TransAmount, MSISDN, BillRefNumber, FirstName, LastName } = data;
+    const amount = parseFloat(TransAmount);
+    if (isNaN(amount)||amount<=0) return res.json({ ResultCode:0, ResultDesc:'Accepted' });
+
+    // Find user by username (BillRefNumber) or phone
+    let user = await User.findOne({ username: BillRefNumber })
+      || await User.findOne({ phone: MSISDN })
+      || await User.findOne({ phone: '0'+String(MSISDN).slice(3) });
+
+    if (!user) {
+      console.warn(`[C2B] Unmatched: ref=${BillRefNumber}, phone=${MSISDN}`);
+      await Transaction.create({ userId: new mongoose.Types.ObjectId(), username: BillRefNumber||MSISDN,
+        type:'deposit', amount, status:'completed', mpesaRef:TransID, phone:MSISDN,
+        note:`Unmatched deposit — Ref:${BillRefNumber}, Name:${FirstName} ${LastName}` });
+      return res.json({ ResultCode:0, ResultDesc:'Accepted' });
+    }
+
+    const balBefore = user.balance;
+    user.balance = Math.round((user.balance + amount)*100)/100;
+    await user.save();
+
+    await Transaction.create({ userId:user._id, username:user.username,
+      type:'deposit', amount, status:'completed', mpesaRef:TransID, phone:MSISDN,
+      note:`M-Pesa deposit — Receipt:${TransID}`,
+      balanceBefore:balBefore, balanceAfter:user.balance });
+
+    console.log(`[C2B CREDITED] ${user.username} +KES ${amount} Receipt:${TransID}`);
+
+    // Notify player live
+    const ps = Object.entries(connectedPlayers).find(([,p])=>p.userId?.toString()===user._id.toString());
+    if (ps) io.to(ps[0]).emit('balance_update', { balance:user.balance, bonusBalance:user.bonusBalance||0,
+      message:`💰 KES ${amount} deposited! Receipt:${TransID}` });
+
+  } catch(err) { console.error('[C2B CONFIRM]', err.message); }
+  return res.json({ ResultCode:0, ResultDesc:'Accepted' });
+});
+
+// ═══════════════════════════════════════════════════════════
+// STK Callback
+// ═══════════════════════════════════════════════════════════
+app.post('/mpesa/stkCallback', async (req, res) => {
+  const cb = req.body?.Body?.stkCallback;
+  console.log('[STK CALLBACK]', JSON.stringify(req.body, null, 2));
+  if (!cb) return res.json({ ResultCode:0, ResultDesc:'Accepted' });
+  const items = cb.CallbackMetadata?.Item||[];
+  const get   = n => items.find(i=>i.Name===n)?.Value;
+  if (cb.ResultCode===0) console.log(`[STK OK] Amount:${get('Amount')} Receipt:${get('MpesaReceiptNumber')} Phone:${get('PhoneNumber')}`);
+  else console.log('[STK FAILED]', cb.ResultDesc);
+  res.json({ ResultCode:0, ResultDesc:'Accepted' });
+});
+
+// ═══════════════════════════════════════════════════════════
+// WITHDRAWAL REQUEST — player submits, pending admin approval
+// ═══════════════════════════════════════════════════════════
+app.post('/withdraw/request', authMiddleware, async (req, res) => {
+  const { amount } = req.body;
+  if (!amount||isNaN(Number(amount))||Number(amount)<10)
+    return res.status(400).json({ success:false, message:'Minimum withdrawal is KES 10.' });
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ success:false, message:'User not found.' });
+    if (user.balance < Number(amount))
+      return res.status(400).json({ success:false, message:'Insufficient balance.' });
+
+    const pending = await WithdrawalRequest.findOne({ userId:user._id, status:'pending' });
+    if (pending) return res.status(400).json({ success:false, message:'You already have a pending withdrawal.' });
+
+    const balBefore = user.balance;
+    user.balance = Math.round((user.balance - Number(amount))*100)/100;
+    await user.save();
+
+    const wd = await WithdrawalRequest.create({ userId:user._id, username:user.username,
+      phone:user.phone, amount:Number(amount), status:'pending' });
+
+    await Transaction.create({ userId:user._id, username:user.username,
+      type:'withdrawal', amount:Number(amount), status:'pending', phone:user.phone,
+      note:'Withdrawal request — pending admin approval',
+      balanceBefore:balBefore, balanceAfter:user.balance });
+
+    io.to('admins').emit('new_withdrawal', { id:wd._id, username:user.username,
+      phone:user.phone, amount:Number(amount), createdAt:wd.createdAt });
+
+    return res.json({ success:true, message:'Withdrawal submitted. Pending approval.', balance:user.balance, requestId:wd._id });
+  } catch(err) {
+    console.error('[WITHDRAW REQUEST]', err.message);
+    return res.status(500).json({ success:false, message:'Server error.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Get pending withdrawals
+// ═══════════════════════════════════════════════════════════
+app.get('/admin/withdrawals', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  try {
+    const requests = await WithdrawalRequest.find({ status:'pending' }).sort({ createdAt:-1 }).limit(50);
+    return res.json({ success:true, requests });
+  } catch(err) { return res.status(500).json({ success:false, message:'Server error.' }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Approve withdrawal → fires B2C
+// ═══════════════════════════════════════════════════════════
+app.post('/admin/withdrawals/:id/approve', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  try {
+    const wd = await WithdrawalRequest.findById(req.params.id);
+    if (!wd) return res.status(404).json({ success:false, message:'Not found.' });
+    if (wd.status!=='pending') return res.status(400).json({ success:false, message:'Already processed.' });
+
+    wd.status='processing'; await wd.save();
+
+    let msisdn = String(wd.phone).replace(/[\s\-]/g,'');
+    if (msisdn.startsWith('+')) msisdn=msisdn.slice(1);
+    if (!msisdn.startsWith('254')) {
+      if (msisdn.startsWith('0')) msisdn='254'+msisdn.slice(1);
+      else if (msisdn.length===9) msisdn='254'+msisdn;
+    }
+
+    const token  = await getB2CToken();
+    const secCred = getSecurityCredential();
+    const origID = 'PKR-'+Date.now()+'-'+Math.random().toString(36).slice(2,8).toUpperCase();
+
+    const b2cRes = await axios.post(`${DARAJA_BASE}/mpesa/b2c/v3/paymentrequest`, {
+      OriginatorConversationID:origID, InitiatorName:B2C_INITIATOR_NAME,
+      SecurityCredential:secCred, CommandID:'BusinessPayment',
+      Amount:Math.floor(wd.amount), PartyA:B2C_SHORTCODE, PartyB:msisdn,
+      Remarks:'PesaKrash Withdrawal',
+      QueueTimeOutURL:`${RENDER_URL}/b2c/timeout`,
+      ResultURL:`${RENDER_URL}/b2c/result`,
+      Occasion:'PesaKrash Withdraw'
+    }, { headers:{ Authorization:`Bearer ${token}` } });
+
+    wd.conversationId = b2cRes.data.ConversationID;
+    wd.processedAt    = new Date();
+    await wd.save();
+
+    await Transaction.findOneAndUpdate(
+      { userId:wd.userId, type:'withdrawal', status:'pending' },
+      { status:'processing', note:`B2C initiated — ConvID:${b2cRes.data.ConversationID}` }
+    );
+
+    io.to('admins').emit('withdrawal_update', { id:wd._id, status:'processing' });
+    return res.json({ success:true, message:'B2C initiated.', data:b2cRes.data });
+  } catch(err) {
+    await WithdrawalRequest.findByIdAndUpdate(req.params.id, { status:'pending' });
+    console.error('[APPROVE]', err.response?.data||err.message);
+    return res.status(500).json({ success:false, message:err.response?.data?.errorMessage||err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Reject withdrawal → refund player
+// ═══════════════════════════════════════════════════════════
+app.post('/admin/withdrawals/:id/reject', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  try {
+    const wd = await WithdrawalRequest.findById(req.params.id);
+    if (!wd) return res.status(404).json({ success:false, message:'Not found.' });
+    if (wd.status!=='pending') return res.status(400).json({ success:false, message:'Already processed.' });
+
+    const user = await User.findById(wd.userId);
+    if (user) {
+      user.balance = Math.round((user.balance + wd.amount)*100)/100;
+      await user.save();
+      const ps = Object.entries(connectedPlayers).find(([,p])=>p.userId?.toString()===user._id.toString());
+      if (ps) io.to(ps[0]).emit('balance_update', { balance:user.balance, bonusBalance:user.bonusBalance||0,
+        message:`❌ Withdrawal rejected. KES ${wd.amount} refunded.` });
+    }
+
+    wd.status='rejected'; wd.adminNote=req.body.note||'Rejected by admin'; wd.processedAt=new Date();
+    await wd.save();
+
+    await Transaction.findOneAndUpdate(
+      { userId:wd.userId, type:'withdrawal', status:'pending' },
+      { status:'failed', note:`Rejected: ${wd.adminNote}` }
+    );
+
+    io.to('admins').emit('withdrawal_update', { id:wd._id, status:'rejected' });
+    return res.json({ success:true, message:'Rejected and refunded.' });
+  } catch(err) {
+    console.error('[REJECT]', err.message);
+    return res.status(500).json({ success:false, message:'Server error.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Get all transactions
+// ═══════════════════════════════════════════════════════════
+app.get('/admin/transactions', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  try {
+    const page=parseInt(req.query.page)||1, limit=parseInt(req.query.limit)||50;
+    const filter = req.query.type ? { type:req.query.type } : {};
+    const txs   = await Transaction.find(filter).sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit);
+    const total = await Transaction.countDocuments(filter);
+    return res.json({ success:true, transactions:txs, total, page, pages:Math.ceil(total/limit) });
+  } catch(err) { return res.status(500).json({ success:false, message:'Server error.' }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Get all users
+// ═══════════════════════════════════════════════════════════
+app.get('/admin/users', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  try {
+    const users = await User.find().select('-password').sort({ createdAt:-1 }).limit(200);
+    return res.json({ success:true, users });
+  } catch(err) { return res.status(500).json({ success:false, message:'Server error.' }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — Manually adjust user balance
+// ═══════════════════════════════════════════════════════════
+app.post('/admin/users/:id/balance', async (req, res) => {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD)
+    return res.status(401).json({ success:false, message:'Unauthorized.' });
+  const { amount, type, note } = req.body;
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success:false, message:'User not found.' });
+    const balBefore = user.balance;
+    if (type==='credit') user.balance=Math.round((user.balance+Number(amount))*100)/100;
+    else if (type==='debit') {
+      if (user.balance<Number(amount)) return res.status(400).json({ success:false, message:'Insufficient balance.' });
+      user.balance=Math.round((user.balance-Number(amount))*100)/100;
+    }
+    await user.save();
+    await Transaction.create({ userId:user._id, username:user.username,
+      type:type==='credit'?'deposit':'withdrawal', amount:Number(amount), status:'completed',
+      note:note||`Admin manual ${type}`, balanceBefore:balBefore, balanceAfter:user.balance });
+    const ps = Object.entries(connectedPlayers).find(([,p])=>p.userId?.toString()===user._id.toString());
+    if (ps) io.to(ps[0]).emit('balance_update', { balance:user.balance, bonusBalance:user.bonusBalance||0,
+      message:note||`Balance updated by admin` });
+    return res.json({ success:true, balance:user.balance });
+  } catch(err) { return res.status(500).json({ success:false, message:'Server error.' }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// PLAYER — Transaction history
+// ═══════════════════════════════════════════════════════════
+app.get('/auth/transactions', authMiddleware, async (req, res) => {
+  try {
+    const txs = await Transaction.find({ userId:req.userId }).sort({ createdAt:-1 }).limit(50);
+    return res.json({ success:true, transactions:txs });
+  } catch(err) { return res.status(500).json({ success:false, message:'Server error.' }); }
 });
 
 // MPESA CALLBACK
